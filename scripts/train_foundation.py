@@ -26,6 +26,7 @@ import imageio
 import cv2
 from tqdm import tqdm
 import datetime
+import matplotlib.pyplot as plt
 
 
 # Add parent directory to path for imports
@@ -36,7 +37,7 @@ sys.path.append(f'{code_dir}/../')
 from core.foundation_stereo import FoundationStereo
 from core.utils.utils import InputPadder
 from Utils import *
-from scripts.stereo_transforms import get_training_transforms, get_validation_transforms
+from Utils import vis_disparity
 from dataloaders.middlebury_dataset import MiddleburyDataset
 from dataloaders.middlebury2021_dataset import Middlebury2021Dataset
 from dataloaders.kittistereo_dataset import KITTIStereoDataset
@@ -65,35 +66,132 @@ def sequence_loss(init_disp, disp_preds, gt_disp, valid_mask, gamma=0.9):
     n_predictions = len(disp_preds)
     flow_loss = 0.0
     
-    # Loss on initial prediction at 1/4 resolution
+    # Print shapes for debugging
+    print(f"init_disp shape: {init_disp.shape}")
+    print(f"gt_disp shape: {gt_disp.shape}")
+    print(f"valid_mask shape: {valid_mask.shape}")
     
-    # Convert boolean mask to float for max pooling
-    valid_mask_float = valid_mask.float()
+    # Ensure all inputs have the correct shape
+    if init_disp.shape != gt_disp.shape:
+        # Downsample ground truth to match initial prediction
+        gt_disp = F.interpolate(gt_disp, size=init_disp.shape[2:], mode='bilinear', align_corners=False)
+        valid_mask = F.interpolate(valid_mask.float(), size=init_disp.shape[2:], mode='nearest') > 0.5
     
-    # Downsample disparity and mask
-    down_disp = F.interpolate(gt_disp, scale_factor=0.25, mode='bilinear', align_corners=False)
-    down_mask = F.max_pool2d(valid_mask_float, kernel_size=4, stride=4) > 0.99
+    # Convert boolean mask to float for loss calculation
+    valid_mask = valid_mask.float()
+    
+    # Clip ground truth values to max_disp range
+    max_disp = 416  # Maximum disparity value from args
+    gt_disp = torch.clamp(gt_disp, min=0, max=max_disp)
+    
+    # Normalize disparity values to [0, 1] range
+    init_disp = init_disp / max_disp
+    gt_disp = gt_disp / max_disp
+    disp_preds = [dp / max_disp for dp in disp_preds]
+    
+    # Print normalized ranges for debugging
+    print(f"Normalized init_disp range: [{init_disp.min():.2f}, {init_disp.max():.2f}]")
+    print(f"Normalized gt_disp range: [{gt_disp.min():.2f}, {gt_disp.max():.2f}]")
     
     # Calculate loss on initial prediction
-    i_loss = F.smooth_l1_loss(init_disp[down_mask], down_disp[down_mask], reduction='mean')
+    i_loss = F.smooth_l1_loss(init_disp[valid_mask > 0.5], gt_disp[valid_mask > 0.5], reduction='mean')
     flow_loss += i_loss
     
     # Loss on subsequent predictions with decaying weights
     for i in range(n_predictions):
         curr_pred = disp_preds[i]
         i_weight = gamma**(n_predictions - i - 1)
-        i_loss = F.smooth_l1_loss(curr_pred[valid_mask], gt_disp[valid_mask], reduction='mean')
+        
+        # Ensure prediction matches ground truth shape
+        if curr_pred.shape != gt_disp.shape:
+            curr_pred = F.interpolate(curr_pred, size=gt_disp.shape[2:], mode='bilinear', align_corners=False)
+        
+        i_loss = F.smooth_l1_loss(curr_pred[valid_mask > 0.5], gt_disp[valid_mask > 0.5], reduction='mean')
         flow_loss += i_weight * i_loss
         
     # Average the losses
     flow_loss = flow_loss / (n_predictions + 1)
+    
+    # Check for NaN or infinite values
+    if torch.isnan(flow_loss) or torch.isinf(flow_loss):
+        print("Warning: Loss is NaN or infinite!")
+        print(f"init_disp range: [{init_disp.min():.2f}, {init_disp.max():.2f}]")
+        print(f"gt_disp range: [{gt_disp.min():.2f}, {gt_disp.max():.2f}]")
+        print(f"valid_mask range: [{valid_mask.min():.2f}, {valid_mask.max():.2f}]")
+        print(f"Number of valid pixels: {(valid_mask > 0.5).sum().item()}")
+        print(f"Raw loss values: initial={i_loss.item():.4f}, final={flow_loss.item():.4f}")
+    
     return flow_loss
+
+
+def plot_training_batch(left, right, disp_gt, init_disp, disp_preds, padder, args):
+    """Plot training batch visualization including input images, ground truth, predictions and error map.
+    
+    Args:
+        left: Left input image tensor
+        right: Right input image tensor
+        disp_gt: Ground truth disparity tensor
+        init_disp: Initial disparity prediction tensor
+        disp_preds: List of disparity prediction tensors
+        padder: InputPadder instance
+        args: Training arguments
+    """
+    fig, axes = plt.subplots(2, 3, figsize=(15, 10))
+    
+    # Unpad predictions
+    disp_preds = [padder.unpad(dp) for dp in disp_preds]
+    init_disp = padder.unpad(init_disp)
+    
+    # Convert tensors to numpy for visualization
+    left_np = left[0].cpu().permute(1, 2, 0).detach().numpy()
+    right_np = right[0].cpu().permute(1, 2, 0).detach().numpy()
+    disp_gt_np = disp_gt[0, 0].cpu().detach().numpy()
+    init_disp_np = init_disp[0, 0].cpu().detach().numpy()
+    final_disp_np = disp_preds[-1][0, 0].cpu().detach().numpy()
+    
+    # Handle zero values in ground truth
+    disp_gt_np = np.where(disp_gt_np == 0, np.nan, disp_gt_np)
+    error_map = np.abs(final_disp_np - disp_gt_np)
+    
+    # Get min/max values excluding nan/inf
+    vmin = np.min(disp_gt_np[~np.isnan(disp_gt_np) & ~np.isinf(disp_gt_np)])
+    vmax = np.max(disp_gt_np[~np.isnan(disp_gt_np) & ~np.isinf(disp_gt_np)])
+    
+    # Visualize images
+    axes[0, 0].imshow(left_np)
+    axes[0, 0].set_title('Left Image')
+    axes[0, 0].axis('off')
+    
+    axes[0, 1].imshow(right_np)
+    axes[0, 1].set_title('Right Image')
+    axes[0, 1].axis('off')
+    
+    axes[0, 2].imshow(disp_gt_np, cmap="turbo", vmin=vmin, vmax=vmax)
+    axes[0, 2].set_title('Ground Truth Disparity')
+    axes[0, 2].axis('off')
+    
+    axes[1, 0].imshow(init_disp_np, cmap="turbo")
+    axes[1, 0].set_title('Initial Predicted Disparity')
+    axes[1, 0].axis('off')
+    
+    axes[1, 1].imshow(final_disp_np, cmap="turbo", vmin=vmin, vmax=vmax)
+    axes[1, 1].set_title('Final Predicted Disparity')
+    axes[1, 1].axis('off')
+    
+    axes[1, 2].imshow(error_map, cmap='turbo')
+    axes[1, 2].set_title('Error Map')
+    axes[1, 2].axis('off')
+    
+    plt.tight_layout()
+    plt.show()
 
 
 def train_epoch(model, train_loader, optimizer, epoch, args, writer=None):
     """Train for one epoch"""
     model.train()
     total_loss = 0
+    valid_loss_count = 0  # Count of valid (non-NaN) losses
+    nan_loss_count = 0    # Count of NaN losses
     
     pbar = tqdm(train_loader, desc=f"Epoch {epoch} Training")
     
@@ -107,16 +205,9 @@ def train_epoch(model, train_loader, optimizer, epoch, args, writer=None):
         left, right, disp_gt = batch_data["im2"], batch_data["im3"], batch_data["gt"]
         has_disp = torch.ones(left.shape[0], dtype=torch.bool)  # Assume all samples have disparity
 
-        
         # Ensure inputs are float tensors
         left = left.cuda().float()
         right = right.cuda().float()
-
-        print(f"left: {left.shape}, right: {right.shape}")
-        print(f"left type: {left.dtype}, right type: {right.dtype}")
-        print(f"left device: {left.device}, right device: {right.device}")
-        print(f"left value range: [{left.min():.2f}, {left.max():.2f}], right value range: [{right.min():.2f}, {right.max():.2f}]")
-        print()
 
         padder = InputPadder(left.shape, divis_by=32, force_square=False)
         left, right = padder.pad(left, right)
@@ -126,7 +217,13 @@ def train_epoch(model, train_loader, optimizer, epoch, args, writer=None):
         valid_samples = torch.where(has_disp)[0]
         if len(valid_samples) == 0:
             continue
-        
+                # Visualize every N batches
+        if batch_idx % args.log_interval == 0:
+            with torch.no_grad():
+                with torch.cuda.amp.autocast(True):
+                    init_disp, disp_preds = model(left, right, iters=args.train_iters)
+            plot_training_batch(left, right, disp_gt, init_disp, disp_preds, padder, args)
+
         # Clear gradients
         optimizer.zero_grad()
         
@@ -144,6 +241,12 @@ def train_epoch(model, train_loader, optimizer, epoch, args, writer=None):
             # Calculate loss
             loss = sequence_loss(init_disp, disp_preds, disp_gt, valid_mask)
         
+        # Check for NaN loss
+        if torch.isnan(loss):
+            nan_loss_count += 1
+            logging.warning(f"NaN loss detected at batch {batch_idx}")
+            continue
+            
         # Backward pass and optimize with scaler
         scaler.scale(loss).backward()
         scaler.step(optimizer)
@@ -151,23 +254,33 @@ def train_epoch(model, train_loader, optimizer, epoch, args, writer=None):
         
         # Log statistics
         total_loss += loss.item()
-        pbar.set_postfix({"Loss": loss.item()})
+        valid_loss_count += 1
         
-        if writer and batch_idx % args.log_interval == 0:
-            global_step = epoch * len(train_loader) + batch_idx
-            wandb.log({
-                'Train/Loss': loss.item(),
-                'epoch': epoch,
-                'global_step': global_step
-            })
+        # Update progress bar with both valid and NaN loss counts
+        pbar.set_postfix({
+            "Loss": loss.item() if not torch.isnan(loss) else "NaN",
+            "Valid": valid_loss_count,
+            "NaN": nan_loss_count
+        })
+
+    # Calculate average loss only from valid samples
+    avg_loss = total_loss / valid_loss_count if valid_loss_count > 0 else float('inf')
     
-    avg_loss = total_loss / len(train_loader)
+    # Log final epoch statistics
+    if writer:
+        wandb.log({
+            'Train/Epoch_Avg_Loss': avg_loss,
+            'Train/Epoch_Valid_Loss_Count': valid_loss_count,
+            'Train/Epoch_NaN_Loss_Count': nan_loss_count,
+            'Train/Epoch_Valid_Loss_Ratio': valid_loss_count / (valid_loss_count + nan_loss_count) if (valid_loss_count + nan_loss_count) > 0 else 0,
+            'epoch': epoch
+        })
+    
     return avg_loss
 
 
 def validate(model, val_loader, epoch, args, writer=None):
     """Validate the model"""
-    model.eval()
     total_loss = 0
     total_epe = 0
     total_d1 = 0
@@ -184,8 +297,6 @@ def validate(model, val_loader, epoch, args, writer=None):
             left = left.cuda().float()
             right = right.cuda().float()
             disp_gt = disp_gt.cuda().float()
-            
-            
             # Filter out samples without disparity
             valid_samples = torch.where(has_disp)[0]
             if len(valid_samples) == 0:
@@ -197,7 +308,7 @@ def validate(model, val_loader, epoch, args, writer=None):
             
             # Forward pass with autocast
             with torch.cuda.amp.autocast(enabled=args.mixed_precision):
-                disp_pred = model(left, right, iters=args.valid_iters, test_mode=True)
+                disp_pred = model(left, right, iters=args.valid_iters)
             
             # Unpad outputs
             disp_pred = padder.unpad(disp_pred)
@@ -262,8 +373,8 @@ def main():
     parser = argparse.ArgumentParser(description='Train FoundationStereo')
     
     # Dataset parameters
-    parser.add_argument('--data_dir', type=str, required=True, help='path to dataset directory')
-    parser.add_argument('--dataset_type', type=str, default='middlebury2021', help='dataset type (middlebury, middlebury2021, kitti_stereo, booster, layeredflow)')
+    parser.add_argument('--data_dir', type=str, required=False, default="/nfs/data/eirik/stereoanywhere_assets/datasets/booster/train", help='path to dataset directory') # '/nfs/data/eirik/stereoanywhere_assets/datasets/booster/train' "/nfs/data/eirik/stereoanywhere_assets/datasets/data"
+    parser.add_argument('--dataset_type', type=str, default='booster', help='dataset type (middlebury, middlebury2021, kitti_stereo, booster, layeredflow)')
     parser.add_argument('--val_percent', type=float, default=0.1, help='percentage of data for validation')
     
     # Model parameters
@@ -280,8 +391,9 @@ def main():
     
     # Data augmentation parameters
     parser.add_argument('--do_augmentation', action='store_true', default=False, help='apply data augmentation')
-    parser.add_argument('--crop_height', type=int, default=384//2, help='random crop height')
-    parser.add_argument('--crop_width', type=int, default=512//2, help='random crop width')
+    parser.add_argument('--crop_height', type=int, default=300//2, help='random crop height')
+    parser.add_argument('--crop_width', type=int, default=500//2, help='random crop width')
+
     
     # System parameters
     parser.add_argument('--seed', type=int, default=42, help='random seed')
@@ -304,7 +416,7 @@ def main():
     parser.add_argument('--corr_radius', type=int, default=4, help='correlation radius')
     
     # Add new argument for freezing depth_anything
-    parser.add_argument('--freeze_depth_anything', action='store_true', default=False, 
+    parser.add_argument('--freeze_depth_anything', action='store_true', default=True, 
                         help='freeze the depth_anything part of the model')
     
     args = parser.parse_args()
@@ -359,21 +471,13 @@ def main():
     model = FoundationStereo(args)
     wandb.watch(model)
     
-    # Define transforms for training and validation
-    train_transform = get_training_transforms(
-        crop_size=(args.crop_height, args.crop_width),
-        do_augmentation=args.do_augmentation
-    )
-    
-    val_transform = get_validation_transforms()
-    
     # Create train dataset
     aug_params = {
         'crop_size': (args.crop_height, args.crop_width),
-        'min_scale': -0.2,
-        'max_scale': 0.5,
-        'do_flip': True,
-        'asym': 0.2
+        'do_flip': False,
+        'min_scale': 0.1,
+        'max_scale': .3,
+        
     } if args.do_augmentation else None
 
     # Verify that the data directory exists
@@ -445,7 +549,10 @@ def main():
         try:
             val_dataset = train_dataset.__class__(
                 datapath=val_dir,
-                aug_params=None,  # No augmentation for validation
+                aug_params={
+                    'crop_size': (args.crop_height, args.crop_width),
+                    'do_flip': False,  # No flipping for validation
+                },
                 test=True,
                 mono=None,
                 scale_factor=1.0
@@ -466,7 +573,10 @@ def main():
         try:
             temp_val_dataset = train_dataset.__class__(
                 datapath=args.data_dir,
-                aug_params=None,  # No augmentation for validation
+                aug_params={
+                    'crop_size': (args.crop_height, args.crop_width),
+                    'do_flip': False,  # No flipping for validation
+                },
                 test=True,
                 mono=None,
                 scale_factor=1.0
