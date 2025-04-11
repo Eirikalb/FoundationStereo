@@ -1,6 +1,6 @@
 # FoundationStereo: Zero-Shot Stereo Matching
 
-This is the official implementation of our paper accepted by CVPR 2025 (**All strong accept**)
+This is the official implementation of our paper accepted by CVPR 2025 Oral (**All strong accept**)
 
 [[Website]](https://nvlabs.github.io/FoundationStereo/) [[Paper]](https://arxiv.org/abs/2501.09898) [[Video]](https://www.youtube.com/watch?v=R7RgHxEXB3o)
 
@@ -45,6 +45,12 @@ conda activate foundation_stereo
 
 # Model Weights
 - Download the foundation model for zero-shot inference on your data from [here](https://drive.google.com/drive/folders/1VhPebc_mMxWKccrv7pdQLTvXYVcLYpsf?usp=sharing). Put the entire folder (e.g. `23-51-11`) under `./pretrained_models/`.
+
+
+| Model | Description |
+| ----- | ----------- |
+| 23-51-11 | Our best performing model for general use, based on Vit-large |
+| 11-33-40 | Slightly lower accuracy but faster inference, based on Vit-small |
 
 
 # Run demo
@@ -122,6 +128,9 @@ It will produce:
 
 - Q: How to run with RealSense?<br>
   A: See [this](https://github.com/NVlabs/FoundationStereo/issues/26)
+
+- Q: I have two or multiple RGB cameras, can I run this? <br>
+  A: You can first rectify a pair of images using this [OpenCV function](https://docs.opencv.org/4.x/d9/d0c/group__calib3d.html#ga617b1685d4059c6040827800e72ad2b6) into stereo image pair (now they don't have relative rotations), then feed into FoundationStereo.
 
 
 # BibTeX

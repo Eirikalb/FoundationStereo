@@ -10,6 +10,7 @@ class FoundationStereoOnnx(FoundationStereo):
     def __init__(self, args):
         super().__init__(args)
 
+    @torch.no_grad()
     def forward(self, left, right):
         """ Removes extra outputs and hyper-parameters """
         with torch.amp.autocast('cuda', enabled=True):
